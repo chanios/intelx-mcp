@@ -12,12 +12,26 @@ export interface SearchRequest {
 }
 
 export interface PhonebookSearchRequest extends SearchRequest {
-  target?: 'all' | 'domains' | 'emails' | 'urls';
+  target?: "all" | "domains" | "emails" | "urls";
 }
 
 export interface SearchResponse {
   id: string;
   status: number;
+}
+
+export interface SearchRecordNormalized {
+  systemid: string;
+  bucket: string;
+  name: string;
+
+  indexfile?: string;
+  storageid: string;
+  media: number;
+  type: number;
+
+  added: string;
+  date: string;
 }
 
 export interface SearchRecord {
@@ -55,6 +69,11 @@ export interface PhonebookSelector {
   selectortypeh: string;
   selectorvalue: string;
   [key: string]: unknown;
+}
+
+export interface PhonebookSelectorNormalized {
+  type: number;
+  value: string;
 }
 
 export interface PhonebookResultResponse {
@@ -100,10 +119,20 @@ export interface IdentityRecord {
     name: string;
     date: string;
     bucket: string;
+    storageid: string;
+    systemid: string;
     [key: string]: unknown;
   };
   linea: string;
   [key: string]: unknown;
+}
+
+export interface IdentityNormalizedRecord {
+  line: string;
+  systemid: string;
+  storageid: string;
+  filename: string;
+  date: string;
 }
 
 export interface IdentitySearchResponse {
@@ -132,4 +161,3 @@ export interface IntelXError {
   code: number;
   message: string;
 }
-

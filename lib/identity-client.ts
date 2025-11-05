@@ -3,9 +3,9 @@ import type {
   IdentitySearchResponse,
   IdentityRecord,
   AccountRecord,
-  AccountExportResponse
-} from './types.js';
-import { API_ROOTS, API_RATE_LIMIT_MS } from './constants.js';
+  AccountExportResponse,
+} from "./types.js";
+import { API_ROOTS, API_RATE_LIMIT_MS } from "./constants.js";
 
 export class IdentityClient {
   private apiKey: string;
@@ -13,7 +13,7 @@ export class IdentityClient {
   private userAgent: string;
   private lastRequestTime: number = 0;
 
-  constructor(apiKey: string, userAgent: string = 'IntelX-MCP/1.0') {
+  constructor(apiKey: string, userAgent: string = "IntelX-MCP/1.0") {
     this.apiKey = apiKey;
     this.apiRoot = API_ROOTS.IDENTITY;
     this.userAgent = userAgent;
@@ -23,15 +23,17 @@ export class IdentityClient {
     const now = Date.now();
     const timeSinceLastRequest = now - this.lastRequestTime;
     if (timeSinceLastRequest < API_RATE_LIMIT_MS) {
-      await new Promise(resolve => setTimeout(resolve, API_RATE_LIMIT_MS - timeSinceLastRequest));
+      await new Promise((resolve) =>
+        setTimeout(resolve, API_RATE_LIMIT_MS - timeSinceLastRequest),
+      );
     }
     this.lastRequestTime = Date.now();
   }
 
   private getHeaders(): Record<string, string> {
     return {
-      'X-Key': this.apiKey,
-      'User-Agent': this.userAgent
+      "X-Key": this.apiKey,
+      "User-Agent": this.userAgent,
     };
   }
 
@@ -40,27 +42,27 @@ export class IdentityClient {
 
     const queryParams = new URLSearchParams({
       selector: params.selector,
-      bucket: params.bucket || '',
+      bucket: params.bucket || "",
       skipinvalid: String(params.skipinvalid ?? false),
       limit: String(params.limit || 100),
       analyze: String(params.analyze ?? false),
-      datefrom: params.datefrom || '',
-      dateto: params.dateto || '',
-      terminate: JSON.stringify(params.terminate || [])
+      datefrom: params.datefrom || "",
+      dateto: params.dateto || "",
+      terminate: JSON.stringify(params.terminate || []),
     });
 
     const response = await fetch(
       `${this.apiRoot}/live/search/internal?${queryParams}`,
-      { headers: this.getHeaders() }
+      { headers: this.getHeaders() },
     );
 
     if (!response.ok) {
       throw new Error(`API error ${response.status}: ${response.statusText}`);
     }
 
-    const data = await response.json() as IdentitySearchResponse;
+    const data = (await response.json()) as IdentitySearchResponse;
     const searchId = data.id;
-    
+
     if (String(searchId).length <= 3) {
       throw new Error(`Invalid search ID: ${searchId}`);
     }
@@ -69,7 +71,7 @@ export class IdentityClient {
     let maxresults = params.limit || 100;
 
     while (true) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
 
       const results = await this.getSearchResults(searchId, maxresults);
 
@@ -97,25 +99,28 @@ export class IdentityClient {
     return allRecords;
   }
 
-  private async getSearchResults(searchId: string, maxresults: number): Promise<IdentitySearchResponse> {
+  private async getSearchResults(
+    searchId: string,
+    maxresults: number,
+  ): Promise<IdentitySearchResponse> {
     await this.rateLimit();
 
     const queryParams = new URLSearchParams({
       id: searchId,
-      format: '1',
-      limit: String(maxresults)
+      format: "1",
+      limit: String(maxresults),
     });
 
     const response = await fetch(
       `${this.apiRoot}/live/search/result?${queryParams}`,
-      { headers: this.getHeaders() }
+      { headers: this.getHeaders() },
     );
 
     if (!response.ok) {
       throw new Error(`API error ${response.status}: ${response.statusText}`);
     }
 
-    return await response.json() as IdentitySearchResponse;
+    return (await response.json()) as IdentitySearchResponse;
   }
 
   private async terminateSearch(searchId: string): Promise<void> {
@@ -123,10 +128,9 @@ export class IdentityClient {
 
     const queryParams = new URLSearchParams({ id: searchId });
 
-    await fetch(
-      `${this.apiRoot}/live/search/terminate?${queryParams}`,
-      { headers: this.getHeaders() }
-    );
+    await fetch(`${this.apiRoot}/live/search/terminate?${queryParams}`, {
+      headers: this.getHeaders(),
+    });
   }
 
   async exportAccounts(
@@ -135,29 +139,29 @@ export class IdentityClient {
     buckets?: string,
     datefrom?: string,
     dateto?: string,
-    terminate?: string[]
+    terminate?: string[],
   ): Promise<AccountRecord[]> {
     await this.rateLimit();
 
     const queryParams = new URLSearchParams({
       selector: selector,
-      bucket: buckets || '',
+      bucket: buckets || "",
       limit: String(maxresults),
-      datefrom: datefrom || '',
-      dateto: dateto || '',
-      terminate: JSON.stringify(terminate || [])
+      datefrom: datefrom || "",
+      dateto: dateto || "",
+      terminate: JSON.stringify(terminate || []),
     });
 
     const response = await fetch(
       `${this.apiRoot}/accounts/csv?${queryParams}`,
-      { headers: this.getHeaders() }
+      { headers: this.getHeaders() },
     );
 
     if (!response.ok) {
       throw new Error(`API error ${response.status}: ${response.statusText}`);
     }
 
-    const data = await response.json() as AccountExportResponse;
+    const data = (await response.json()) as AccountExportResponse;
     const searchId = data.id;
 
     if (String(searchId).length <= 3) {
@@ -168,7 +172,7 @@ export class IdentityClient {
     let remaining = maxresults;
 
     while (true) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
 
       const results = await this.getSearchResults(searchId, remaining);
 
@@ -188,4 +192,3 @@ export class IdentityClient {
     return allRecords;
   }
 }
-

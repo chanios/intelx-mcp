@@ -1,8 +1,12 @@
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { z } from 'zod';
-import { IntelXClient } from './lib/intelx-client.js';
-import { IdentityClient } from './lib/identity-client.js';
+import {
+  McpServer,
+  ResourceTemplate,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+import { IntelXClient } from "./lib/intelx-client.js";
+import { IdentityClient } from "./lib/identity-client.js";
+import express from "express";
 import {
   intelligentSearchSchema,
   phonebookSearchSchema,
@@ -13,31 +17,45 @@ import {
   fileTreeViewSchema,
   getSelectorsSchema,
   identitySearchSchema,
-  exportAccountsSchema
-} from './lib/validators.js';
+  exportAccountsSchema,
+} from "./lib/validators.js";
+import {
+  getOriginalUuid,
+  normalizeIdentityRecords,
+  normalizeIntelxId,
+  denormalizeIntelxId,
+  getNormalizedId,
+  normalizePhoneBookResponse,
+  normalizeSearchRecordResponse,
+} from "./lib/postprocess.js";
 
 const INTELX_API_KEY = process.env.INTELX_API_KEY;
 
 if (!INTELX_API_KEY) {
-  console.error('Error: INTELX_API_KEY environment variable is required');
-  console.error('Available env vars:', Object.keys(process.env).filter(k => k.includes('INTELX')));
+  console.error("Error: INTELX_API_KEY environment variable is required");
+  console.error(
+    "Available env vars:",
+    Object.keys(process.env).filter((k) => k.includes("INTELX")),
+  );
   process.exit(1);
 }
 
-console.error(`[IntelX MCP] Using API key: ${INTELX_API_KEY.substring(0, 8)}...${INTELX_API_KEY.substring(INTELX_API_KEY.length - 4)}`);
+console.error(
+  `[IntelX MCP] Using API key: ${INTELX_API_KEY.substring(0, 8)}...${INTELX_API_KEY.substring(INTELX_API_KEY.length - 4)}`,
+);
 
 const intelxClient = new IntelXClient(INTELX_API_KEY);
 const identityClient = new IdentityClient(INTELX_API_KEY);
 
 const server = new McpServer({
-  name: 'intelx-server',
-    version: '1.0.0'
+  name: "intelx-server",
+  version: "1.0.0",
 });
 
 server.registerTool(
-  'intelx_intelligent_search',
+  "intelx_intelligent_search",
   {
-    title: 'Intelligence X Search',
+    title: "Intelligence X Search",
     description: `Search Intelligence X data archive for STRONG SELECTORS ONLY.
 
 SUPPORTED SELECTOR TYPES (exact format required):
@@ -64,7 +82,7 @@ PARAMETERS:
 - term: The selector to search (REQUIRED)
 - maxresults: Max results per bucket (default: 100)
 - buckets: Array of bucket names (leave empty for all buckets)
-  AVAILABLE BUCKETS: darknet, dns, documents.public, dumpster, leaks.logs, 
+  AVAILABLE BUCKETS: darknet, dns, documents.public, dumpster, leaks.logs,
   leaks.private, leaks.public, pastes, usenet, web.gov.ru, web.public, whois
   Example: ["pastes", "darknet", "leaks.public"]
 - timeout: Search timeout in seconds (default: 5)
@@ -82,27 +100,32 @@ NOTE: Invalid bucket names will cause a 401 error. Use empty array [] to search 
       dateto: z.string().optional(),
       sort: z.number().optional(),
       media: z.number().optional(),
-      terminate: z.array(z.string()).optional()
-    }
+      terminate: z.array(z.string()).optional(),
+    },
   },
   async (params) => {
     const validated = intelligentSearchSchema.parse(params);
-    const results = await intelxClient.search(validated);
-    
-        return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(results, null, 2) 
-      }],
-      structuredContent: results as Record<string, unknown>
-        };
-    }
+    const results = await intelxClient
+      .search(validated)
+      .then(normalizeSearchRecordResponse)
+      .then(normalizeIntelxId);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(results, null, 2),
+        },
+      ],
+      structuredContent: { results } as Record<string, unknown>,
+    };
+  },
 );
 
 server.registerTool(
-  'intelx_phonebook_search',
+  "intelx_phonebook_search",
   {
-    title: 'Intelligence X Phonebook Search',
+    title: "Intelligence X Phonebook Search",
     description: `Search phonebook for selectors. Returns list of related selectors.
 
 USE CASES:
@@ -126,7 +149,7 @@ PARAMETERS:
   * "urls" - Only URL results
 - maxresults: Max results to return (default: 100)
 - buckets: Optional bucket filter (leave empty for all)
-  Available: darknet, dns, documents.public, dumpster, leaks.logs, leaks.private, 
+  Available: darknet, dns, documents.public, dumpster, leaks.logs, leaks.private,
   leaks.public, pastes, usenet, web.gov.ru, web.public, whois
 - timeout: Search timeout in seconds (default: 5)`,
     inputSchema: {
@@ -134,51 +157,59 @@ PARAMETERS:
       maxresults: z.number().optional(),
       buckets: z.array(z.string()).optional(),
       timeout: z.number().optional(),
-      target: z.enum(['all', 'domains', 'emails', 'urls']).optional()
-    }
+      target: z.enum(["all", "domains", "emails", "urls"]).optional(),
+    },
   },
   async (params) => {
     const validated = phonebookSearchSchema.parse(params);
-    
-    const results = await intelxClient.phonebookSearchComplete(validated);
-    
+
+    const results = await intelxClient
+      .phonebookSearchComplete(validated)
+      .then(normalizePhoneBookResponse);
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(results, null, 2) 
-      }],
-      structuredContent: { results } as Record<string, unknown>
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(results, null, 2),
+        },
+      ],
+      structuredContent: { results } as Record<string, unknown>,
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_terminate_search',
+  "intelx_terminate_search",
   {
-    title: 'Terminate Search',
-    description: 'Terminate an ongoing Intelligence X search by ID',
+    title: "Terminate Search",
+    description: "Terminate an ongoing Intelligence X search by ID",
     inputSchema: {
-      search_id: z.string()
-    }
+      search_id: z.string(),
+    },
   },
   async (params) => {
     const validated = terminateSearchSchema.parse(params);
     const success = await intelxClient.terminateSearch(validated.search_id);
-    
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: success ? 'Search terminated successfully' : 'Failed to terminate search'
-      }],
-      structuredContent: { success }
+      content: [
+        {
+          type: "text",
+          text: success
+            ? "Search terminated successfully"
+            : "Failed to terminate search",
+        },
+      ],
+      structuredContent: { success },
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_file_preview',
+  "intelx_file_preview",
   {
-    title: 'File Preview',
+    title: "File Preview",
     description: `Preview first N lines of a file from Intelligence X search results.
 
 REQUIRED FROM SEARCH RESULTS:
@@ -198,32 +229,42 @@ USE CASE: Quick preview of file contents before full download`,
       media_type: z.number(),
       content_type: z.number(),
       lines: z.number().optional(),
-      format: z.enum(['text', 'picture']).optional()
-    }
+      format: z.enum(["text", "picture"]).optional(),
+    },
   },
   async (params) => {
     const validated = filePreviewSchema.parse(params);
-    const formatValue = validated.format === 'picture' ? 1 : 0;
-    
-    const preview = await intelxClient.filePreview(
-      validated.storage_id,
-      validated.bucket,
-      validated.media_type,
-      validated.content_type,
-      validated.lines,
-      formatValue
+    const formatValue = validated.format === "picture" ? 1 : 0;
+
+    const originalStorageId = getOriginalUuid(
+      "storageid",
+      +validated.storage_id,
     );
-    
+    if (!originalStorageId) {
+      throw new Error(`Invalid storage_id: ${validated.storage_id}`);
+    }
+
+    const preview = await intelxClient
+      .filePreview(
+        originalStorageId,
+        validated.bucket,
+        validated.media_type,
+        validated.content_type,
+        validated.lines,
+        formatValue,
+      )
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ type: 'text', text: preview }]
+      content: [{ type: "text", text: JSON.stringify(preview, null, 2) }],
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_file_view',
+  "intelx_file_view",
   {
-    title: 'File View',
+    title: "File View",
     description: `View full file contents with automatic format conversion.
 
 AUTOMATIC CONVERSIONS:
@@ -245,29 +286,39 @@ USE CASE: Read full document content in human-readable format`,
       storage_id: z.string(),
       bucket: z.string(),
       media_type: z.number(),
-      content_type: z.number()
-    }
+      content_type: z.number(),
+    },
   },
   async (params) => {
     const validated = fileViewSchema.parse(params);
-    
-    const content = await intelxClient.fileView(
-      validated.storage_id,
-      validated.bucket,
-      validated.media_type,
-      validated.content_type
+
+    const originalStorageId = getOriginalUuid(
+      "storageid",
+      +validated.storage_id,
     );
-    
+    if (!originalStorageId) {
+      throw new Error(`Invalid storage_id: ${validated.storage_id}`);
+    }
+
+    const content = await intelxClient
+      .fileView(
+        originalStorageId,
+        validated.bucket,
+        validated.media_type,
+        validated.content_type,
+      )
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ type: 'text', text: content }]
+      content: [{ type: "text", text: JSON.stringify(content, null, 2) }],
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_file_read',
+  "intelx_file_read",
   {
-    title: 'File Read',
+    title: "File Read",
     description: `Download raw binary file contents from Intelligence X.
 
 REQUIRED FROM SEARCH RESULTS:
@@ -280,37 +331,43 @@ USE CASE: Download original file (images, PDFs, executables, etc.) without conve
     inputSchema: {
       system_id: z.string(),
       bucket: z.string(),
-      filename: z.string().optional()
-    }
+      filename: z.string().optional(),
+    },
   },
   async (params) => {
     const validated = fileReadSchema.parse(params);
-    
-    const data = await intelxClient.fileRead(
-      validated.system_id,
-      validated.bucket
-    );
-    
+
+    const originalSystemId = getOriginalUuid("systemid", +validated.system_id);
+    if (!originalSystemId) {
+      throw new Error(`Invalid system_id: ${validated.system_id}`);
+    }
+
+    const data = await intelxClient
+      .fileRead(originalSystemId, validated.bucket)
+      .then(normalizeIntelxId);
+
     const buffer = Buffer.from(data);
-    const base64 = buffer.toString('base64');
-    
+    const base64 = buffer.toString("base64");
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: `File downloaded (${buffer.length} bytes). Base64: ${base64.substring(0, 100)}...`
-      }],
+      content: [
+        {
+          type: "text",
+          text: `File downloaded (${buffer.length} bytes). Base64: ${base64.substring(0, 100)}...`,
+        },
+      ],
       structuredContent: {
         size: buffer.length,
-        base64: base64
-      }
+        base64: base64,
+      },
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_file_treeview',
+  "intelx_file_treeview",
   {
-    title: 'File Tree View',
+    title: "File Tree View",
     description: `Get hierarchical tree of related files.
 
 USE CASES:
@@ -333,32 +390,48 @@ WORKFLOW:
     inputSchema: {
       bucket: z.string(),
       storage_id: z.string().optional(),
-      system_id: z.string().optional()
-    }
+      system_id: z.string().optional(),
+    },
   },
   async (params) => {
     const validated = fileTreeViewSchema.parse(params);
-    
-    const tree = await intelxClient.fileTreeView(
-      validated.bucket,
-      validated.storage_id,
-      validated.system_id
-    );
-    
+
+    let originalStorageId: string | undefined;
+    if (validated.storage_id) {
+      originalStorageId = getOriginalUuid("storageid", +validated.storage_id);
+      if (!originalStorageId) {
+        throw new Error(`Invalid storage_id: ${validated.storage_id}`);
+      }
+    }
+
+    let originalSystemId: string | undefined;
+    if (validated.system_id) {
+      originalSystemId = getOriginalUuid("systemid", +validated.system_id);
+      if (!originalSystemId) {
+        throw new Error(`Invalid system_id: ${validated.system_id}`);
+      }
+    }
+
+    const tree = await intelxClient
+      .fileTreeView(validated.bucket, originalStorageId, originalSystemId)
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(tree, null, 2) 
-      }],
-      structuredContent: { tree } as Record<string, unknown>
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(tree, null, 2),
+        },
+      ],
+      structuredContent: { tree } as Record<string, unknown>,
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_get_selectors',
+  "intelx_get_selectors",
   {
-    title: 'Extract Selectors',
+    title: "Extract Selectors",
     description: `Extract all selectors found in a document.
 
 EXTRACTS:
@@ -377,47 +450,61 @@ RETURNS: Array of {type, value} objects for each selector found
 
 USE CASE: Discover related identifiers in a document to search for additional context`,
     inputSchema: {
-      system_id: z.string()
-    }
+      system_id: z.string(),
+    },
   },
   async (params) => {
     const validated = getSelectorsSchema.parse(params);
-    const selectors = await intelxClient.getSelectors(validated.system_id);
-    
+
+    const originalSystemId = getOriginalUuid("systemid", +validated.system_id);
+    if (!originalSystemId) {
+      throw new Error(`Invalid system_id: ${validated.system_id}`);
+    }
+
+    const selectors = await intelxClient
+      .getSelectors(originalSystemId)
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(selectors, null, 2) 
-      }],
-      structuredContent: { selectors } as Record<string, unknown>
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(selectors, null, 2),
+        },
+      ],
+      structuredContent: { selectors } as Record<string, unknown>,
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_get_capabilities',
+  "intelx_get_capabilities",
   {
-    title: 'Get Account Capabilities',
-    description: 'Get current API account capabilities and permissions',
-    inputSchema: {}
+    title: "Get Account Capabilities",
+    description: "Get current API account capabilities and permissions",
+    inputSchema: {},
   },
   async () => {
-    const capabilities = await intelxClient.getCapabilities();
-    
+    const capabilities = await intelxClient
+      .getCapabilities()
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(capabilities, null, 2) 
-      }],
-      structuredContent: capabilities
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(capabilities, null, 2),
+        },
+      ],
+      structuredContent: capabilities,
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_identity_search',
+  "intelx_identity_search",
   {
-    title: 'Identity Search',
+    title: "Identity Search",
     description: `Search identity/breach database for compromised data.
 
 SEARCH TERMS:
@@ -433,7 +520,7 @@ PARAMETERS:
 - analyze: Include breach analysis (default: false)
 - skip_invalid: Skip invalid results (default: false)
 
-RETURNS: Array of breach records with item info and line data
+RETURNS: Array of breach records with systemid, storageid, filename, and line data
 
 USE CASE: Find data breaches, leaked credentials, compromised accounts`,
     inputSchema: {
@@ -444,27 +531,32 @@ USE CASE: Find data breaches, leaked credentials, compromised accounts`,
       dateto: z.string().optional(),
       analyze: z.boolean().optional(),
       skip_invalid: z.boolean().optional(),
-      terminate: z.array(z.string()).optional()
-    }
+      terminate: z.array(z.string()).optional(),
+    },
   },
   async (params) => {
     const validated = identitySearchSchema.parse(params);
-    const results = await identityClient.search(validated);
-    
+    const results = await identityClient
+      .search(validated)
+      .then(normalizeIdentityRecords)
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(results, null, 2) 
-      }],
-      structuredContent: { results } as Record<string, unknown>
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(results, null, 2),
+        },
+      ],
+      structuredContent: { results } as Record<string, unknown>,
     };
-  }
+  },
 );
 
 server.registerTool(
-  'intelx_export_accounts',
+  "intelx_export_accounts",
   {
-    title: 'Export Leaked Accounts',
+    title: "Export Leaked Accounts",
     description: `Export leaked usernames and passwords from breaches.
 
 SEARCH TERMS:
@@ -491,99 +583,156 @@ WARNING: Contains sensitive credential data. Handle responsibly.`,
       buckets: z.string().optional(),
       datefrom: z.string().optional(),
       dateto: z.string().optional(),
-      terminate: z.array(z.string()).optional()
-    }
+      terminate: z.array(z.string()).optional(),
+    },
   },
   async (params) => {
     const validated = exportAccountsSchema.parse(params);
-    
-    const accounts = await identityClient.exportAccounts(
-      validated.selector,
-      validated.maxresults,
-      validated.buckets,
-      validated.datefrom,
-      validated.dateto,
-      validated.terminate
-    );
-    
+
+    const accounts = await identityClient
+      .exportAccounts(
+        validated.selector,
+        validated.maxresults,
+        validated.buckets,
+        validated.datefrom,
+        validated.dateto,
+        validated.terminate,
+      )
+      .then(normalizeIntelxId);
+
     return {
-      content: [{ 
-        type: 'text', 
-        text: JSON.stringify(accounts, null, 2) 
-      }],
-      structuredContent: { accounts } as Record<string, unknown>
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(accounts, null, 2),
+        },
+      ],
+      structuredContent: { accounts } as Record<string, unknown>,
     };
-  }
+  },
 );
 
 server.registerResource(
-  'search',
-  new ResourceTemplate('intelx://search/{searchId}', { list: undefined }),
+  "search",
+  new ResourceTemplate("intelx://search/{searchId}", { list: undefined }),
   {
-    title: 'Search Results',
-    description: 'Access Intelligence X search results by ID'
+    title: "Search Results",
+    description: "Access Intelligence X search results by ID",
   },
   async (uri, { searchId }) => {
-    const results = await intelxClient.getSearchResults(searchId as string, 100);
-    
+    const results = await intelxClient
+      .getSearchResults(searchId as string, 100)
+      .then(normalizeIntelxId);
+
     return {
-      contents: [{
-        uri: uri.href,
-        text: JSON.stringify(results, null, 2),
-        mimeType: 'application/json'
-      }]
+      contents: [
+        {
+          uri: uri.href,
+          text: JSON.stringify(results, null, 2),
+          mimeType: "application/json",
+        },
+      ],
     };
-  }
+  },
 );
 
 server.registerResource(
-  'file',
-  new ResourceTemplate('intelx://file/{systemId}/{bucket}', { list: undefined }),
+  "file",
+  new ResourceTemplate("intelx://file/{systemId}/{bucket}", {
+    list: undefined,
+  }),
   {
-    title: 'File Content',
-    description: 'Access file contents from Intelligence X'
+    title: "File Content",
+    description: "Access file contents from Intelligence X",
+    inputSchema: {
+      storageId: z.number(),
+      bucket: z.string(),
+    },
   },
   async (uri, { systemId, bucket }) => {
-    const data = await intelxClient.fileRead(systemId as string, bucket as string);
+    if (!systemId || !bucket) {
+      throw new Error("Missing required parameters");
+    }
+
+    const data = await intelxClient.fileRead(
+      getOriginalUuid("systemid", +systemId) as string,
+      bucket as string,
+    );
     const buffer = Buffer.from(data);
-    
+
     return {
-      contents: [{
-                uri: uri.href,
-        blob: buffer.toString('base64'),
-        mimeType: 'application/octet-stream'
-      }]
+      contents: [
+        {
+          uri: uri.href,
+          blob: buffer.toString("base64"),
+          mimeType: "application/octet-stream",
+        },
+      ],
     };
-  }
+  },
 );
 
 server.registerResource(
-  'tree',
-  new ResourceTemplate('intelx://tree/{storageId}/{bucket}', { list: undefined }),
+  "tree",
+  new ResourceTemplate("intelx://tree/{storageId}/{bucket}", {
+    list: undefined,
+  }),
   {
-    title: 'File Tree',
-    description: 'Access file tree view from Intelligence X'
+    title: "File Tree",
+    description: "Access file tree view from Intelligence X",
+    inputSchema: {
+      storageId: z.number(),
+      bucket: z.string(),
+    },
   },
   async (uri, { storageId, bucket }) => {
-    const tree = await intelxClient.fileTreeView(bucket as string, storageId as string);
-    
+    if (!storageId || !bucket) {
+      throw new Error("Missing required parameters");
+    }
+
+    const tree = await intelxClient
+      .fileTreeView(
+        bucket as string,
+        getOriginalUuid("storageid", +storageId) as string,
+      )
+      .then(normalizeIntelxId);
+
     return {
-      contents: [{
-        uri: uri.href,
-        text: JSON.stringify(tree, null, 2),
-        mimeType: 'application/json'
-      }]
+      contents: [
+        {
+          uri: uri.href,
+          text: JSON.stringify(tree, null, 2),
+          mimeType: "application/json",
+        },
+      ],
     };
-  }
+  },
 );
 
-async function main() {
-  const transport = new StdioServerTransport();
-    await server.connect(transport);
-  console.error('Intelligence X MCP Server running on stdio');
-}
+const app = express();
+app.use(express.json());
 
-main().catch((error) => {
-  console.error('Fatal error:', error);
-    process.exit(1);
+app.post("/mcp", async (req, res) => {
+  // Create a new transport for each request to prevent request ID collisions
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+
+  res.on("close", () => {
+    transport.close();
+  });
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
 });
+
+const port = parseInt(process.env.PORT || "3000");
+app
+  .listen(port, () => {
+    console.log(`Demo MCP Server running on http://localhost:${port}/mcp`);
+  })
+  .on("error", (error) => {
+    console.error("Server error:", error);
+    process.exit(1);
+  });
