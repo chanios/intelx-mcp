@@ -1,13 +1,14 @@
+import { join, dirname } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import type {
-  AccountNormalizedRecord,
-  AccountRecord,
   IdentityNormalizedRecord,
   IdentityRecord,
   PhonebookResultResponse,
-  PhonebookSelectorNormalized,
   SearchRecordNormalized,
   SearchResultResponse,
   Selector,
+  TreeViewItem,
 } from "./types";
 
 const TRANSITION_FIELDS = [
@@ -21,181 +22,225 @@ const TRANSITION_FIELDS = [
 ] as const;
 type TransitionField = (typeof TRANSITION_FIELDS)[number];
 
-/* ------------------------------------------------------------------ */
-/* 1. Dynamically create maps & counters from TRANSITION_FIELDS      */
-/* ------------------------------------------------------------------ */
-const uuidToIdMaps = new Map<TransitionField, Map<string, number>>();
-const idToUuidMaps = new Map<TransitionField, Map<number, string>>();
-const counters: Record<TransitionField, number> = {} as any;
+const TRANSITION_SET = new Set<string>(TRANSITION_FIELDS);
+const MAX_MAP_SIZE = 10_000;
+const PRUNE_FRACTION = 0.25;
 
-for (const field of TRANSITION_FIELDS) {
-  uuidToIdMaps.set(field, new Map<string, number>());
-  idToUuidMaps.set(field, new Map<number, string>());
-  counters[field] = 1;
+// --- Persistence ---
+// ID mappings live in SQLite so they survive restarts, writes are incremental
+// and atomic, and several server processes can share the store safely.
+// AUTOINCREMENT guarantees an evicted ID is never reassigned to another file.
+const STORE_DIR = dirname(import.meta.dir);
+const DB_PATH = join(STORE_DIR, ".id-store.sqlite");
+const LEGACY_JSON_PATH = join(STORE_DIR, ".id-store.json");
+
+type IdEntry = { uuid: string; field: TransitionField };
+
+const db = new Database(DB_PATH, { create: true });
+db.run("PRAGMA journal_mode = WAL");
+db.run("PRAGMA busy_timeout = 5000");
+db.run(`CREATE TABLE IF NOT EXISTS ids (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  field TEXT NOT NULL,
+  uuid TEXT NOT NULL,
+  last_used INTEGER NOT NULL,
+  UNIQUE (field, uuid)
+)`);
+db.run("CREATE INDEX IF NOT EXISTS ids_last_used ON ids (last_used)");
+
+const upsertStmt = db.query<{ id: number }, [string, string, number]>(
+  `INSERT INTO ids (field, uuid, last_used) VALUES (?1, ?2, ?3)
+   ON CONFLICT (field, uuid) DO UPDATE SET last_used = excluded.last_used
+   RETURNING id`,
+);
+const byIdStmt = db.query<IdEntry, [number]>("SELECT uuid, field FROM ids WHERE id = ?1");
+const byKeyStmt = db.query<{ id: number }, [string, string]>(
+  "SELECT id FROM ids WHERE field = ?1 AND uuid = ?2",
+);
+const touchStmt = db.query<null, [number, number]>("UPDATE ids SET last_used = ?2 WHERE id = ?1");
+const countStmt = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM ids");
+const pruneStmt = db.query<null, [number]>(
+  "DELETE FROM ids WHERE id IN (SELECT id FROM ids ORDER BY last_used ASC LIMIT ?1)",
+);
+
+// One-time import of the old JSON store so previously issued IDs keep resolving.
+function migrateLegacyJson(): void {
+  if (countStmt.get()!.n > 0 || !existsSync(LEGACY_JSON_PATH)) return;
+  try {
+    const raw = JSON.parse(readFileSync(LEGACY_JSON_PATH, "utf8"));
+    if (!raw || typeof raw.counter !== "number" || !Array.isArray(raw.entries)) return;
+    const insert = db.query<null, [number, string, string, number]>(
+      "INSERT OR IGNORE INTO ids (id, field, uuid, last_used) VALUES (?1, ?2, ?3, ?4)",
+    );
+    db.transaction(() => {
+      // Entries are in insertion order; preserve that as recency.
+      raw.entries.forEach(([id, entry]: [number, IdEntry], i: number) => {
+        insert.run(id, entry.field, entry.uuid, i);
+      });
+      // Make sure new IDs continue after the old counter.
+      db.run("DELETE FROM sqlite_sequence WHERE name = 'ids'");
+      db.run("INSERT INTO sqlite_sequence (name, seq) VALUES ('ids', ?)", [raw.counter - 1]);
+    })();
+  } catch {
+    // Corrupt legacy store — start fresh
+  }
 }
 
-/* ------------------------------------------------------------------ */
-/* 2. Forward: normalizeIntelxId (UUID → int)                         */
-/* ------------------------------------------------------------------ */
+migrateLegacyJson();
+
+function pruneIfNeeded(): void {
+  const n = countStmt.get()!.n;
+  if (n <= MAX_MAP_SIZE) return;
+  pruneStmt.run(n - MAX_MAP_SIZE + Math.floor(MAX_MAP_SIZE * PRUNE_FRACTION));
+}
+
+let insertsSincePruneCheck = 0;
+
+function assignId(field: TransitionField, uuid: string): number {
+  const id = upsertStmt.get(field, uuid, Date.now())!.id;
+  if (++insertsSincePruneCheck >= 100) {
+    insertsSincePruneCheck = 0;
+    pruneIfNeeded();
+  }
+  return id;
+}
+
+function lookupEntry(id: number): IdEntry | undefined {
+  const entry = byIdStmt.get(id) ?? undefined;
+  if (entry) touchStmt.run(id, Date.now());
+  return entry;
+}
+
 function normalizeIntelxId<T>(results: T): T {
-  function deepScan(obj: any): any {
+  function scan(obj: any): any {
     if (obj === null || typeof obj !== "object") return obj;
-    if (Array.isArray(obj)) return obj.map(deepScan);
-
-    const copy: any = {};
-    for (const [key, value] of Object.entries(obj)) {
-      if (
-        TRANSITION_FIELDS.includes(key as TransitionField) &&
-        typeof value === "string"
-      ) {
-        const field = key as TransitionField;
-        const map = uuidToIdMaps.get(field)!;
-
-        if (!map.has(value)) {
-          const newId = counters[field]++;
-          map.set(value, newId);
-          idToUuidMaps.get(field)!.set(newId, value);
-        }
-        copy[key] = map.get(value);
-      } else {
-        copy[key] = deepScan(value);
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) scan(obj[i]);
+      return obj;
+    }
+    for (const key in obj) {
+      const val = obj[key];
+      if (TRANSITION_SET.has(key) && typeof val === "string") {
+        obj[key] = assignId(key as TransitionField, val);
+      } else if (val !== null && typeof val === "object") {
+        scan(val);
       }
     }
-    return copy;
+    return obj;
   }
-
-  return deepScan(results) as T;
+  return db.transaction(() => scan(results))() as T;
 }
 
-/* ------------------------------------------------------------------ */
-/* 3. Reverse: denormalizeIntelxId (int → UUID)                       */
-/* ------------------------------------------------------------------ */
 function denormalizeIntelxId<T>(normalized: T): T {
-  function deepScan(obj: any): any {
+  function scan(obj: any): any {
     if (obj === null || typeof obj !== "object") return obj;
-    if (Array.isArray(obj)) return obj.map(deepScan);
-
-    const copy: any = {};
-    for (const [key, value] of Object.entries(obj)) {
-      if (
-        TRANSITION_FIELDS.includes(key as TransitionField) &&
-        typeof value === "number"
-      ) {
-        const field = key as TransitionField;
-        const original = idToUuidMaps.get(field)?.get(value);
-        copy[key] = original ?? value; // fallback to number if not mapped
+    if (Array.isArray(obj)) return obj.map(scan);
+    const out: any = {};
+    for (const key in obj) {
+      const val = obj[key];
+      if (TRANSITION_SET.has(key) && typeof val === "number") {
+        out[key] = lookupEntry(val)?.uuid ?? val;
       } else {
-        copy[key] = deepScan(value);
+        out[key] = scan(val);
       }
     }
-    return copy;
+    return out;
+  }
+  return scan(normalized) as T;
+}
+
+function getOriginalUuid(_field: TransitionField, id: number): string | undefined {
+  return lookupEntry(id)?.uuid;
+}
+
+function getEntry(id: number): IdEntry | undefined {
+  return lookupEntry(id);
+}
+
+function getNormalizedId(field: TransitionField, uuid: string): number | undefined {
+  return byKeyStmt.get(field, uuid)?.id;
+}
+
+function normalizeIdentityRecords(allRecords: IdentityRecord[]): IdentityNormalizedRecord[] {
+  const merged: Record<string, IdentityNormalizedRecord> = {};
+
+  for (const r of allRecords) {
+    const sid = r.item.storageid;
+    const existing = merged[sid];
+    if (existing) {
+      existing.line += "; " + r.linea;
+    } else {
+      merged[sid] = {
+        line: r.linea,
+        system_id: r.item.systemid,
+        storage_id: sid,
+        bucket: r.item.bucket,
+        filename: r.item.name,
+        date: r.item.date,
+      };
+    }
   }
 
-  return deepScan(normalized) as T;
-}
-
-function getOriginalUuid(
-  field: TransitionField,
-  id: number,
-): string | undefined {
-  return idToUuidMaps.get(field)?.get(id);
-}
-
-function getNormalizedId(
-  field: TransitionField,
-  uuid: string,
-): number | undefined {
-  return uuidToIdMaps.get(field)?.get(uuid);
-}
-
-function normalizeIdentityRecords(
-  allRecords: IdentityRecord[],
-): IdentityNormalizedRecord[] {
-  let mergedByStorageId: Record<string, IdentityNormalizedRecord> = {};
-  let normalizedRecords = allRecords.map((record) => ({
-    line: record.linea,
-    system_id: record.item.systemid,
-    storage_id: record.item.storageid,
-    bucket: record.item.bucket,
-    filename: record.item.name,
-    date: record.item.date,
-  }));
-  normalizedRecords.forEach((record) => {
-    if (!mergedByStorageId[record.storage_id])
-      mergedByStorageId[record.storage_id] = { ...record, line: "" };
-
-    mergedByStorageId[record.storage_id]!.line += "\n" + record.line;
-  });
-
-  normalizedRecords = Object.values(mergedByStorageId);
-
-  normalizedRecords = normalizedRecords.map((record) => {
-    let line = record.line.trim();
-
-    if (line.length > 128) {
-      line = line.slice(0, 128) + `...(More ${line.length - 128} characters)`;
+  const results = Object.values(merged);
+  for (const rec of results) {
+    if (rec.line.length > 512) {
+      rec.line = rec.line.slice(0, 512) + `...+${rec.line.length - 512}ch`;
     }
-    return {
-      ...record,
-      line,
-    };
-  });
-
-  return normalizeIntelxId(normalizedRecords);
+  }
+  return normalizeIntelxId(results);
 }
 
-function normalizePhoneBookResponse(
-  allRecords: PhonebookResultResponse[],
-): string[] {
-  return allRecords.flatMap((response) =>
-    response.selectors.map((record) => record.selectorvalue),
-  );
+function normalizePhoneBookResponse(allRecords: PhonebookResultResponse[]): string[] {
+  const out: string[] = [];
+  for (const resp of allRecords) {
+    for (const sel of resp.selectors) {
+      out.push(sel.selectorvalue);
+    }
+  }
+  return out;
 }
 
 function normalizeSelectors(allRecords: Selector[]): string[] {
-  return allRecords.map((record) => record.selector);
+  return allRecords.map((r) => r.selector);
 }
-function normalizeAccountRecords(
-  allRecords: AccountRecord[],
-): AccountNormalizedRecord[] {
-  return allRecords.map((record) => ({
-    user: record.user,
-    password: record.password,
-    passwordtype: record.passwordtype,
-    source: record.sourcelong,
-    system_id: record.systemid,
 
-    date: record.date,
-    added: record.added,
+function normalizeTreeViewResponse(items: TreeViewItem[] | null | undefined, parentBucket?: string) {
+  if (!items?.length) return [];
+  return items.map((r) => ({
+    system_id: r.systemid,
+    name: r.name,
+    date: r.date,
+    media: r.media,
+    type: r.type,
+    size: r.size,
+    bucket: r.bucket || parentBucket || "",
+    ...(r.storageid ? { storage_id: r.storageid } : {}),
   }));
 }
 
-function normalizeSearchRecordResponse(
-  response: SearchResultResponse,
-): SearchRecordNormalized[] {
-  return response.records.map((record) => ({
-    system_id: record.systemid,
-    bucket: record.bucket,
-    name: record.name,
-
-    indexfile: record.indexfile,
-    storage_id: record.storageid,
-    media: record.media,
-    type: record.type,
-
-    added: record.added,
-    date: record.date,
+function normalizeSearchRecordResponse(response: SearchResultResponse): SearchRecordNormalized[] {
+  return response.records.map((r) => ({
+    system_id: r.systemid,
+    bucket: r.bucket,
+    name: r.name,
+    indexfile: r.indexfile,
+    storage_id: r.storageid,
+    media: r.media,
+    type: r.type,
+    added: r.added,
+    date: r.date,
   }));
 }
 
 export {
   normalizeSearchRecordResponse,
+  normalizeTreeViewResponse,
   normalizePhoneBookResponse,
   normalizeIdentityRecords,
-  normalizeAccountRecords,
   normalizeSelectors,
   normalizeIntelxId,
   denormalizeIntelxId,
   getOriginalUuid,
+  getEntry,
   getNormalizedId,
 };

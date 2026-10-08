@@ -32,3 +32,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# runtime ID mapping store (lib/postprocess.ts; .json is the legacy format)
+.id-store.json
+.id-store.sqlite*

@@ -85,5 +85,37 @@ export const PHONEBOOK_TARGETS = {
   URLS: 3
 } as const;
 
-export const API_RATE_LIMIT_MS = 1000;
+export const API_RATE_LIMIT_MS = 1000; // kept for backwards compat, actual limiter in rate-limiter.ts
 
+// Pre-compiled selector validation regexes (avoids re-compilation per request)
+const SELECTOR_PATTERNS = {
+  email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+  domain: /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/i,
+  url: /^https?:\/\/[^\s/$.?#].[^\s]*$/i,
+  ipv4: /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/,
+  ipv6: /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/,
+  cidr: /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\/(?:\d|[1-2]\d|3[0-2])$/,
+  phone: /^\+?[1-9]\d{1,14}$/,
+  bitcoin: /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/,
+  mac: /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/,
+  ipfs: /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/,
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  creditCard: /^(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|3\d{13}|6(?:011|5\d{2})\d{12})$/,
+  iban: /^[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}$/,
+} as const;
+
+export function isStrongSelector(term: string): boolean {
+  return Object.values(SELECTOR_PATTERNS).some((re) => re.test(term));
+}
+
+export function isDomainOrEmail(term: string): boolean {
+  return SELECTOR_PATTERNS.email.test(term) || SELECTOR_PATTERNS.domain.test(term);
+}
+
+export function isDomainEmailOrUrl(term: string): boolean {
+  return (
+    SELECTOR_PATTERNS.domain.test(term) ||
+    SELECTOR_PATTERNS.email.test(term) ||
+    SELECTOR_PATTERNS.url.test(term)
+  );
+}

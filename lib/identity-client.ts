@@ -2,32 +2,25 @@ import type {
   IdentitySearchRequest,
   IdentitySearchResponse,
   IdentityRecord,
-  AccountRecord,
-  AccountExportResponse,
 } from "./types.js";
-import { API_ROOTS, API_RATE_LIMIT_MS } from "./constants.js";
+import { API_ROOTS } from "./constants.js";
+import { RateLimiter } from "./rate-limiter.js";
+
+const POLL_INITIAL_MS = 200;
+const POLL_MAX_MS = 2000;
+const POLL_MULTIPLIER = 1.5;
 
 export class IdentityClient {
   private apiKey: string;
   private apiRoot: string;
   private userAgent: string;
-  private lastRequestTime: number = 0;
+  private limiter: RateLimiter;
 
   constructor(apiKey: string, userAgent: string = "IntelX-MCP/1.0") {
     this.apiKey = apiKey;
     this.apiRoot = API_ROOTS.IDENTITY;
     this.userAgent = userAgent;
-  }
-
-  private async rateLimit(): Promise<void> {
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    if (timeSinceLastRequest < API_RATE_LIMIT_MS) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, API_RATE_LIMIT_MS - timeSinceLastRequest),
-      );
-    }
-    this.lastRequestTime = Date.now();
+    this.limiter = new RateLimiter();
   }
 
   private getHeaders(): Record<string, string> {
@@ -38,9 +31,9 @@ export class IdentityClient {
   }
 
   async search(params: IdentitySearchRequest): Promise<IdentityRecord[]> {
-    await this.rateLimit();
+    await this.limiter.wait();
 
-    const queryParams = new URLSearchParams({
+    const qp = new URLSearchParams({
       selector: params.selector,
       bucket: params.bucket || "",
       skipinvalid: String(params.skipinvalid ?? false),
@@ -51,49 +44,37 @@ export class IdentityClient {
       terminate: JSON.stringify(params.terminate || []),
     });
 
-    const response = await fetch(
-      `${this.apiRoot}/live/search/internal?${queryParams}`,
-      { headers: this.getHeaders() },
-    );
-
+    const response = await fetch(`${this.apiRoot}/live/search/internal?${qp}`, {
+      headers: this.getHeaders(),
+    });
     if (!response.ok) {
-      throw new Error(`API error ${response.status}: ${response.statusText}`);
+      throw new Error(`API ${response.status}: ${response.statusText}`);
     }
 
     const data = (await response.json()) as IdentitySearchResponse;
-    const searchId = data.id;
-
-    if (String(searchId).length <= 3) {
-      throw new Error(`Invalid search ID: ${searchId}`);
+    if (String(data.id).length <= 3) {
+      throw new Error(`Invalid search ID: ${data.id}`);
     }
 
     const allRecords: IdentityRecord[] = [];
-    let maxresults = params.limit || 100;
+    let remaining = params.limit || 100;
+    let delay = POLL_INITIAL_MS;
 
     while (true) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((r) => setTimeout(r, delay));
+      const results = await this.getSearchResults(data.id, remaining);
 
-      const results = await this.getSearchResults(searchId, maxresults);
-
-      if (results.status === 0 && results.records) {
+      if (results.records?.length) {
         allRecords.push(...results.records);
-        maxresults -= results.records.length;
+        remaining -= results.records.length;
       }
 
-      if (results.status === 2 || maxresults <= 0) {
-        if (results.records) {
-          allRecords.push(...results.records);
-        }
-        if (maxresults <= 0) {
-          await this.terminateSearch(searchId);
-        }
+      if (results.status === 2 || results.status === 3 || remaining <= 0) {
+        if (remaining <= 0 || results.status === 3) await this.terminateSearch(data.id);
         break;
       }
 
-      if (results.status === 3) {
-        await this.terminateSearch(searchId);
-        break;
-      }
+      delay = Math.min(delay * POLL_MULTIPLIER, POLL_MAX_MS);
     }
 
     return allRecords;
@@ -103,92 +84,26 @@ export class IdentityClient {
     searchId: string,
     maxresults: number,
   ): Promise<IdentitySearchResponse> {
-    await this.rateLimit();
-
-    const queryParams = new URLSearchParams({
+    await this.limiter.wait();
+    const qp = new URLSearchParams({
       id: searchId,
       format: "1",
       limit: String(maxresults),
     });
-
-    const response = await fetch(
-      `${this.apiRoot}/live/search/result?${queryParams}`,
-      { headers: this.getHeaders() },
-    );
-
+    const response = await fetch(`${this.apiRoot}/live/search/result?${qp}`, {
+      headers: this.getHeaders(),
+    });
     if (!response.ok) {
-      throw new Error(`API error ${response.status}: ${response.statusText}`);
+      throw new Error(`API ${response.status}: ${response.statusText}`);
     }
-
     return (await response.json()) as IdentitySearchResponse;
   }
 
   private async terminateSearch(searchId: string): Promise<void> {
-    await this.rateLimit();
-
-    const queryParams = new URLSearchParams({ id: searchId });
-
-    await fetch(`${this.apiRoot}/live/search/terminate?${queryParams}`, {
+    await this.limiter.wait();
+    const qp = new URLSearchParams({ id: searchId });
+    await fetch(`${this.apiRoot}/live/search/terminate?${qp}`, {
       headers: this.getHeaders(),
     });
-  }
-
-  async exportAccounts(
-    selector: string,
-    maxresults: number = 100,
-    buckets?: string,
-    datefrom?: string,
-    dateto?: string,
-    terminate?: string[],
-  ): Promise<AccountRecord[]> {
-    await this.rateLimit();
-
-    const queryParams = new URLSearchParams({
-      selector: selector,
-      bucket: buckets || "",
-      limit: String(maxresults),
-      datefrom: datefrom || "",
-      dateto: dateto || "",
-      terminate: JSON.stringify(terminate || []),
-    });
-
-    const response = await fetch(
-      `${this.apiRoot}/accounts/csv?${queryParams}`,
-      { headers: this.getHeaders() },
-    );
-
-    if (!response.ok) {
-      throw new Error(`API error ${response.status}: ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as AccountExportResponse;
-    const searchId = data.id;
-
-    if (String(searchId).length <= 3) {
-      throw new Error(`Invalid search ID: ${searchId}`);
-    }
-
-    const allRecords: AccountRecord[] = [];
-    let remaining = maxresults;
-
-    while (true) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      const results = await this.getSearchResults(searchId, remaining);
-
-      if (results.status === 0 && results.records) {
-        allRecords.push(...(results.records as unknown as AccountRecord[]));
-        remaining -= results.records.length;
-      }
-
-      if (results.status === 2 || remaining <= 0) {
-        if (remaining <= 0) {
-          await this.terminateSearch(searchId);
-        }
-        break;
-      }
-    }
-
-    return allRecords;
   }
 }

@@ -11,7 +11,10 @@ export interface SearchRequest {
   terminate?: string[];
 }
 
-export interface PhonebookSearchRequest extends SearchRequest {
+export interface PhonebookSearchRequest {
+  term: string;
+  buckets?: string[];
+  maxresults?: number;
   target?: "all" | "domains" | "emails" | "urls";
 }
 
@@ -24,12 +27,10 @@ export interface SearchRecordNormalized {
   system_id: string;
   bucket: string;
   name: string;
-
   indexfile?: string;
   storage_id: string;
   media: number;
   type: number;
-
   added: string;
   date: string;
 }
@@ -38,52 +39,33 @@ export interface SearchRecord {
   systemid: string;
   name: string;
   bucket: string;
-  bucketh: string;
   added: string;
   date: string;
-  size: number;
   media: number;
-  mediah: string;
   type: number;
-  typeh: string;
   storageid: string;
-  xscore: number;
-  simhash?: string;
-  description?: string;
-  keyvalues?: Record<string, unknown>;
-  tags?: string[];
-  relations?: string[];
   indexfile?: string;
-  historyfile?: string;
   [key: string]: unknown;
 }
 
 export interface SearchResultResponse {
   status: number;
   records: SearchRecord[];
-  [key: string]: unknown;
 }
 
 export interface PhonebookSelector {
-  selectortype: number;
-  selectortypeh: string;
   selectorvalue: string;
   [key: string]: unknown;
-}
-
-export interface PhonebookSelectorNormalized {
-  type: number;
-  value: string;
 }
 
 export interface PhonebookResultResponse {
   status: number;
   selectors: PhonebookSelector[];
-  [key: string]: unknown;
 }
 
 export interface TreeViewItem {
   systemid: string;
+  storageid?: string;
   name: string;
   date: string;
   media: number;
@@ -94,11 +76,8 @@ export interface TreeViewItem {
 }
 
 export interface Selector {
-  systemid: string;
   selector: string;
-  selectorh: string;
-  type: number;
-  typeh: string;
+  [key: string]: unknown;
 }
 
 export interface CapabilitiesResponse {
@@ -126,7 +105,6 @@ export interface IdentityRecord {
     [key: string]: unknown;
   };
   linea: string;
-  [key: string]: unknown;
 }
 
 export interface IdentityNormalizedRecord {
@@ -142,41 +120,4 @@ export interface IdentitySearchResponse {
   id: string;
   status: number;
   records?: IdentityRecord[];
-  [key: string]: unknown;
-}
-
-export interface AccountNormalizedRecord {
-  user: string;
-  password: string;
-  passwordtype: string;
-  source: string;
-  system_id: string;
-
-  date: string;
-  added: string;
-}
-
-export interface AccountRecord {
-  user: string;
-  password: string;
-  passwordtype: string;
-  sourceshort: string;
-  sourcelong: string;
-  systemid: string;
-
-  date: string;
-  added: string;
-  [key: string]: unknown;
-}
-
-export interface AccountExportResponse {
-  id: string;
-  status: number;
-  records?: AccountRecord[];
-  [key: string]: unknown;
-}
-
-export interface IntelXError {
-  code: number;
-  message: string;
 }

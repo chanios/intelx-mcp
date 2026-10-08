@@ -18,11 +18,9 @@ describe('IntelX API Client', () => {
   describe('Capabilities', () => {
     test('should get API capabilities and account info', async () => {
       const capabilities = await client.getCapabilities();
-      
+
       expect(capabilities).toBeDefined();
       expect(typeof capabilities).toBe('object');
-      // API returns various capability information
-      // Structure may vary, so just verify we get a response
       expect(Object.keys(capabilities).length).toBeGreaterThan(0);
     }, 15000);
   });
@@ -73,7 +71,7 @@ describe('IntelX API Client', () => {
           maxresults: 1,
           timeout: 5
         });
-        expect(false).toBe(true); // Should not reach here
+        expect(false).toBe(true);
       } catch (error) {
         expect(error).toBeDefined();
         expect((error as Error).message).toContain('401');
@@ -87,7 +85,6 @@ describe('IntelX API Client', () => {
         term: 'github.com',
         target: 'emails',
         maxresults: 5,
-        timeout: 10
       });
 
       expect(Array.isArray(results)).toBe(true);
@@ -101,7 +98,6 @@ describe('IntelX API Client', () => {
         term: '@gmail.com',
         target: 'domains',
         maxresults: 5,
-        timeout: 10
       });
 
       expect(Array.isArray(results)).toBe(true);
@@ -112,7 +108,6 @@ describe('IntelX API Client', () => {
         term: 'example.com',
         target: 'all',
         maxresults: 5,
-        timeout: 10
       });
 
       expect(Array.isArray(results)).toBe(true);
@@ -127,7 +122,6 @@ describe('IntelX API Client', () => {
     let testContentType: number;
 
     beforeAll(async () => {
-      // Get a real file from search results
       const searchResults = await client.search({
         term: 'test@example.com',
         buckets: ['pastes'],
@@ -146,24 +140,6 @@ describe('IntelX API Client', () => {
         }
       }
     }, 30000);
-
-    test('should preview file content', async () => {
-      if (!testStorageId) {
-        console.log('Skipping test: no test file available');
-        return;
-      }
-
-      const preview = await client.filePreview(
-        testStorageId,
-        testBucket,
-        testMediaType,
-        testContentType,
-        5
-      );
-
-      expect(typeof preview).toBe('string');
-      expect(preview.length).toBeGreaterThan(0);
-    }, 15000);
 
     test('should view full file content', async () => {
       if (!testStorageId) {
@@ -208,7 +184,6 @@ describe('IntelX API Client', () => {
 
   describe('File Tree View', () => {
     test('should get tree view for stealer log archive', async () => {
-      // Search for stealer logs
       const results = await client.search({
         term: 'gmail.com',
         buckets: ['leaks.logs'],
@@ -220,7 +195,7 @@ describe('IntelX API Client', () => {
         const record = results.records[0];
         if (record?.indexfile) {
           const tree = await client.fileTreeView(record.bucket, record.indexfile);
-          
+
           expect(Array.isArray(tree)).toBe(true);
           if (tree.length > 0) {
             expect(tree[0]?.systemid).toBeDefined();
@@ -246,24 +221,6 @@ describe('IntelX API Client', () => {
       const terminated = await client.terminateSearch(searchId);
       expect(typeof terminated).toBe('boolean');
     }, 20000);
-  });
-
-  describe('Search Statistics', () => {
-    test('should calculate search statistics by bucket', () => {
-      const records = [
-        { bucket: 'pastes', systemid: '1', name: 'test1' },
-        { bucket: 'pastes', systemid: '2', name: 'test2' },
-        { bucket: 'leaks.public', systemid: '3', name: 'test3' },
-        { bucket: 'web.public', systemid: '4', name: 'test4' },
-        { bucket: 'web.public', systemid: '5', name: 'test5' }
-      ];
-
-      const stats = client.searchStats(records);
-
-      expect(stats.pastes).toBe(2);
-      expect(stats['leaks.public']).toBe(1);
-      expect(stats['web.public']).toBe(2);
-    });
   });
 });
 
@@ -307,37 +264,4 @@ describe('IntelX Identity Service', () => {
       expect(Array.isArray(results)).toBe(true);
     }, 30000);
   });
-
-  describe('Account Export', () => {
-    test('should export leaked accounts', async () => {
-      const results = await client.exportAccounts('test@example.com', 5);
-
-      expect(results).toBeDefined();
-      expect(Array.isArray(results)).toBe(true);
-    }, 30000);
-
-    test('should export domain accounts', async () => {
-      const results = await client.exportAccounts('@gmail.com', 3);
-
-      expect(results).toBeDefined();
-      expect(Array.isArray(results)).toBe(true);
-    }, 45000);
-
-    test('should include password types in export', async () => {
-      const results = await client.exportAccounts('test@example.com', 10);
-
-      expect(results).toBeDefined();
-      expect(Array.isArray(results)).toBe(true);
-      
-      // Check if we got results with password information
-      if (results.length > 0) {
-        const account = results[0];
-        if (account) {
-          expect(account.user).toBeDefined();
-          expect(account.password).toBeDefined();
-        }
-      }
-    }, 30000);
-  });
 });
-

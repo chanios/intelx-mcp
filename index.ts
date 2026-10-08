@@ -2,57 +2,108 @@ import {
   McpServer,
   ResourceTemplate,
 } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { mkdir } from "node:fs/promises";
 import { IntelXClient } from "./lib/intelx-client.js";
 import { IdentityClient } from "./lib/identity-client.js";
+import { mintFileToken, redeemFileToken, TOKEN_TTL_MS } from "./lib/file-tokens.js";
 import express from "express";
 import {
   intelligentSearchSchema,
   phonebookSearchSchema,
   terminateSearchSchema,
-  filePreviewSchema,
   fileViewSchema,
   fileReadSchema,
   fileTreeViewSchema,
   getSelectorsSchema,
   identitySearchSchema,
-  exportAccountsSchema,
 } from "./lib/validators.js";
 import {
+  getEntry,
   getOriginalUuid,
   normalizeIdentityRecords,
   normalizeIntelxId,
-  denormalizeIntelxId,
-  getNormalizedId,
   normalizePhoneBookResponse,
   normalizeSearchRecordResponse,
-  normalizeAccountRecords,
   normalizeSelectors,
+  normalizeTreeViewResponse,
 } from "./lib/postprocess.js";
+import {
+  isStrongSelector,
+  isDomainOrEmail,
+  isDomainEmailOrUrl,
+} from "./lib/constants.js";
 
 const INTELX_API_KEY = process.env.INTELX_API_KEY;
 
 if (!INTELX_API_KEY) {
   console.error("Error: INTELX_API_KEY environment variable is required");
-  console.error(
-    "Available env vars:",
-    Object.keys(process.env).filter((k) => k.includes("INTELX")),
-  );
   process.exit(1);
 }
-
-console.error(
-  `[IntelX MCP] Using API key: ${INTELX_API_KEY.substring(0, 8)}...${INTELX_API_KEY.substring(INTELX_API_KEY.length - 4)}`,
-);
 
 const intelxClient = new IntelXClient(INTELX_API_KEY);
 const identityClient = new IdentityClient(INTELX_API_KEY);
 
+const useStdio = process.argv.includes("--stdio") || !process.env.MCP_HTTP;
+const port = parseInt(process.env.PORT || "3000");
+
 const server = new McpServer({
   name: "intelx-server",
-  version: "1.0.0",
+  version: "1.1.0",
 });
+
+// -- Helpers --
+
+function errResponse(msg: string) {
+  return { content: [{ type: "text" as const, text: msg }], isError: true };
+}
+
+function textResponse(data: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+}
+
+function resolveUuid(field: "storage_id" | "system_id" | "indexfile", id: number) {
+  const uuid = getOriginalUuid(field, id);
+  if (!uuid) return errResponse(`Error: Invalid ${field}: ${id}`);
+  return uuid;
+}
+
+function sliceLines(text: string, offset: number, limit: number): { content: string; total_lines: number; offset: number; limit: number } {
+  let total = 0;
+  let startIdx = 0;
+  let endIdx = -1;
+  let lineNum = 0;
+  let sliceStart = -1;
+  let sliceEnd = -1;
+
+  for (let i = 0; i <= text.length; i++) {
+    if (i === text.length || text[i] === "\n") {
+      if (lineNum === offset) sliceStart = startIdx;
+      if (lineNum === offset + limit) {
+        sliceEnd = startIdx - 1;
+      }
+      lineNum++;
+      startIdx = i + 1;
+    }
+  }
+  total = lineNum;
+
+  if (sliceStart === -1) sliceStart = text.length;
+  if (sliceEnd === -1) sliceEnd = text.length;
+
+  return {
+    content: text.slice(sliceStart, sliceEnd),
+    total_lines: total,
+    offset,
+    limit,
+  };
+}
+
+// -- Tools --
 
 server.registerTool(
   "intelx_intelligent_search",
@@ -106,72 +157,12 @@ NOTE: Invalid bucket names will cause a 401 error. Use empty array [] to search 
     try {
       // @ts-ignore
       params.buckets = params.buckets?.split(",") || [];
-
       const validated = intelligentSearchSchema.parse(params);
 
-      // Validate term format - should be a strong selector
-      const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(validated.term);
-      const isDomain =
-        /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/i.test(
-          validated.term,
+      if (!isStrongSelector(validated.term)) {
+        return errResponse(
+          "Error: term should be a strong selector (email, domain, URL, IP address, phone, bitcoin address, etc.)",
         );
-      const isUrl = /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(validated.term);
-      const isIPv4 =
-        /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(
-          validated.term,
-        );
-      const isIPv6 = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/.test(
-        validated.term,
-      );
-      const isCIDR =
-        /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\/(?:[0-9]|[1-2][0-9]|3[0-2])$/.test(
-          validated.term,
-        );
-      const isPhone = /^\+?[1-9]\d{1,14}$/.test(validated.term);
-      const isBitcoin = /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(
-        validated.term,
-      );
-      const isMAC = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/.test(
-        validated.term,
-      );
-      const isIPFS = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(validated.term);
-      const isUUID =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-          validated.term,
-        );
-      const isCreditCard =
-        /^(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3[0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})$/.test(
-          validated.term,
-        );
-      const isIBAN =
-        /^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$/.test(
-          validated.term,
-        );
-
-      if (
-        !isEmail &&
-        !isDomain &&
-        !isUrl &&
-        !isIPv4 &&
-        !isIPv6 &&
-        !isCIDR &&
-        !isPhone &&
-        !isBitcoin &&
-        !isMAC &&
-        !isIPFS &&
-        !isUUID &&
-        !isCreditCard &&
-        !isIBAN
-      ) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: term should be a strong selector (email, domain, URL, IP address, phone, bitcoin address, etc.)",
-            },
-          ],
-          isError: true,
-        };
       }
 
       const results = await intelxClient
@@ -179,25 +170,9 @@ NOTE: Invalid bucket names will cause a 401 error. Use empty array [] to search 
         .then(normalizeSearchRecordResponse)
         .then(normalizeIntelxId);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(results),
-          },
-        ],
-        structuredContent: { results } as Record<string, unknown>,
-      };
+      return textResponse(results);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
@@ -240,53 +215,19 @@ PARAMETERS:
     try {
       // @ts-ignore
       params.buckets = params.buckets?.split(",") || [];
-
       const validated = phonebookSearchSchema.parse(params);
 
-      // Validate term format - should be domain, email, or URL
-      const isDomain =
-        /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/i.test(
-          validated.term,
-        );
-      const isEmail = /^([^\s@]|)+@[^\s@]+\.[^\s@]+$/.test(validated.term);
-      const isUrl = /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(validated.term);
-      console.log(isDomain, isEmail, isUrl);
-
-      if (!isDomain && !isEmail && !isUrl) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: term should be a strong selector (email, domain, URL)",
-            },
-          ],
-          isError: true,
-        };
+      if (!isDomainEmailOrUrl(validated.term)) {
+        return errResponse("Error: term should be a strong selector (email, domain, URL)");
       }
 
       const results = await intelxClient
         .phonebookSearchComplete(validated)
         .then(normalizePhoneBookResponse);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: results.join(" "),
-          },
-        ],
-        structuredContent: { results } as Record<string, unknown>,
-      };
+      return { content: [{ type: "text" as const, text: results.join(" ") }] };
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
@@ -296,247 +237,166 @@ server.registerTool(
   {
     title: "Terminate Search",
     description: "Terminate an ongoing Intelligence X search by ID",
-    inputSchema: {
-      search_id: z.string(),
-    },
+    inputSchema: { search_id: z.string() },
   },
   async (params) => {
     try {
       const validated = terminateSearchSchema.parse(params);
       const success = await intelxClient.terminateSearch(validated.search_id);
-
       return {
         content: [
-          {
-            type: "text",
-            text: success
-              ? "Search terminated successfully"
-              : "Failed to terminate search",
-          },
+          { type: "text" as const, text: success ? "Search terminated successfully" : "Failed to terminate search" },
         ],
-        structuredContent: { success },
       };
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
 
 server.registerTool(
-  "intelx_file_preview",
+  "intelx_file_view",
   {
-    title: "File Preview",
-    description: `Preview first N lines of a file from Intelligence X search results.
+    title: "File View",
+    description: `View full file contents with automatic format conversion (PDF→text, Word→text, Excel→text, etc).
 
-REQUIRED FROM SEARCH RESULTS:
-- storage_id: The "storage_id" field from search result
-- bucket: The "bucket" field from search result
-- media: The "media" field from search result
-- type: The "type" field from search result
+REQUIRED:
+- bucket: The "bucket" field from the result
+- ID: pass either storage_id or system_id from the previous result. The tool auto-detects which API endpoint to use, so just pass whichever ID the result has.
 
 PARAMETERS:
-- lines: Number of lines to preview (default: 8)
-- format: "text" or "picture" (default: "text")
+- media, type: From the result (optional, defaults to 0/1)
+- offset: Line offset to start reading from (default: 0)
+- limit: Max number of lines to return (default: 200)
 
-USE CASE: Quick preview of file contents before full download`,
+RETURNS: JSON with content (text), total_lines, offset, limit for pagination.`,
     inputSchema: {
-      storage_id: z.number(),
+      storage_id: z.number().optional(),
+      system_id: z.number().optional(),
       bucket: z.string(),
-      media: z.number(),
-      type: z.number(),
-      lines: z.number().optional(),
-      format: z.enum(["text", "picture"]).optional(),
+      media: z.number().optional(),
+      type: z.number().optional(),
+      offset: z.number().optional(),
+      limit: z.number().optional(),
     },
   },
   async (params) => {
     try {
-      const validated = filePreviewSchema.parse(params);
-      const formatValue = validated.format === "picture" ? 1 : 0;
+      const validated = fileViewSchema.parse(params);
 
-      const originalStorageId = getOriginalUuid(
-        "storage_id",
-        validated.storage_id,
-      );
-      if (!originalStorageId) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error: Invalid storage_id: ${validated.storage_id}`,
-            },
-          ],
-          isError: true,
-        };
+      const id = validated.storage_id ?? validated.system_id;
+      if (!id) {
+        return errResponse("Error: Either storage_id or system_id is required");
       }
+      const entry = getEntry(id);
+      if (!entry) {
+        return errResponse(`Error: Invalid id: ${id}`);
+      }
+      const idType: "storage" | "system" = entry.field === "system_id" ? "system" : "storage";
 
-      const preview = await intelxClient
-        .filePreview(
-          originalStorageId,
-          validated.bucket,
-          validated.media,
-          validated.type,
-          validated.lines,
-          formatValue,
-        )
-        .then((result) => {
-          if (result.length > 4096) {
-            return result.slice(0, 4096) + "...";
-          }
-          return result;
-        });
-      return {
-        content: [{ type: "text", text: JSON.stringify(preview) }],
-      };
+      const fullText = await intelxClient.fileView(
+        entry.uuid,
+        validated.bucket,
+        validated.media,
+        validated.type,
+        idType,
+      );
+
+      const result = sliceLines(fullText, validated.offset, validated.limit);
+      return textResponse(result);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
 
-// server.registerTool(
-//   "intelx_file_view",
-//   {
-//     title: "File View",
-//     description: `View full file contents with automatic format conversion.
+server.registerTool(
+  "intelx_file_read",
+  {
+    title: "File Read",
+    description: `Read raw file contents from Intelligence X (no format conversion).
 
-// AUTOMATIC CONVERSIONS:
-// - PDF (media=15) → Plain text
-// - Word (media=16) → Plain text
-// - Excel (media=17) → Plain text
-// - PowerPoint (media=18) → Plain text
-// - HTML (media=9,23) → Plain text
-// - Ebook (media=25) → Plain text
+Unlike intelx_file_view (which converts PDF/Word/Excel to text), this returns the
+original file bytes exactly as stored.
 
-// REQUIRED FROM SEARCH RESULTS:
-// - storage_id: The "storage_id" field from search result
-// - bucket: The "bucket" field from search result
-// - media: The "media" field from search result
-// - type: The "type" field from search result
+REQUIRED:
+- system_id: The "system_id" field from a search result
+- bucket: The "bucket" field from the result
 
-// USE CASE: Read full document content in human-readable format`,
-//     inputSchema: {
-//       storage_id: z.number(),
-//       bucket: z.string(),
-//       media: z.number(),
-//       type: z.number(),
-//     },
-//   },
-//   async (params) => {
-//     try {
-//       const validated = fileViewSchema.parse(params);
-//       console.log(validated);
-//       const originalStorageId = getOriginalUuid(
-//         "storage_id",
-//         validated.storage_id,
-//       );
-//       console.log("originalStorageId", originalStorageId);
-//       if (!originalStorageId) {
-//         return {
-//           content: [
-//             {
-//               type: "text",
-//               text: `Error: Invalid storage_id: ${validated.storage_id}`,
-//             },
-//           ],
-//           isError: true,
-//         };
-//       }
+PARAMETERS:
+- type: 0=original file (default), 1=preview
+- encoding: "text" (default) - UTF-8 decoded with line-based pagination (offset/limit); max 50MB
+            "url" - RECOMMENDED for binary or large files: returns a one-time download
+                    URL (valid ${TOKEN_TTL_MS / 60000} min). Fetch it with curl/Bash, e.g.
+                    curl -o file.zip "<url>"
+                    Bytes never enter the LLM context; streamed server-side up to 500MB.
+            "base64" - base64-encoded full content; max 512KB, small binaries only
+                      (certificates, small images). Larger files: use "url".
+- offset/limit: Line pagination (text encoding only)
 
-//       const content = await intelxClient
-//         .fileView(
-//           originalStorageId,
-//           validated.bucket,
-//           validated.media,
-//           validated.type,
-//         )
-//         .then((result) => {
-//           if (result.length > 4096) {
-//             return result.slice(0, 4096) + "...";
-//           }
-//           return result;
-//         });
+RETURNS:
+- text: JSON with content (text), total_lines, offset, limit for pagination
+- url: JSON with url, expires_at — download once, then it is invalidated
+- base64: JSON with content (base64), size (bytes)`,
+    inputSchema: {
+      system_id: z.number(),
+      bucket: z.string(),
+      type: z.number().optional(),
+      encoding: z.enum(["text", "base64", "url"]).optional(),
+      offset: z.number().optional(),
+      limit: z.number().optional(),
+    },
+  },
+  async (params) => {
+    try {
+      const validated = fileReadSchema.parse(params);
+      const resolved = resolveUuid("system_id", validated.system_id);
+      if (typeof resolved !== "string") return resolved;
 
-//       return {
-//         content: [{ type: "text", text: JSON.stringify(content) }],
-//       };
-//     } catch (error) {
-//       return {
-//         content: [
-//           {
-//             type: "text",
-//             text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-//           },
-//         ],
-//         isError: true,
-//       };
-//     }
-//   },
-// );
+      if (validated.encoding === "url" && !useStdio) {
+        const { token, expiresAt } = mintFileToken(resolved, validated.bucket, validated.type);
+        const base = (process.env.MCP_PUBLIC_URL || `http://localhost:${port}`).replace(/\/+$/, "");
+        return textResponse({
+          encoding: "url",
+          url: `${base}/files/${token}`,
+          expires_at: new Date(expiresAt).toISOString(),
+          note: "One-time download link. Fetch with curl/Bash; it is invalidated after first use.",
+        });
+      }
 
-// server.registerTool(
-//   "intelx_file_read",
-//   {
-//     title: "File Read",
-//     description: `Download raw binary file contents from Intelligence X.
+      const data = await intelxClient.fileRead(resolved, validated.bucket, validated.type);
 
-// REQUIRED FROM SEARCH RESULTS:
-// - system_id: The "system_id" field from search result
-// - bucket: The "bucket" field from search result
+      if (validated.encoding === "url") {
+        // stdio mode: no HTTP listener, so spool to local disk instead
+        const spoolDir = join(tmpdir(), "intelx-mcp");
+        await mkdir(spoolDir, { recursive: true });
+        const name = `${resolved}_${validated.bucket}_${Date.now()}`.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const path = join(spoolDir, name);
+        await Bun.write(path, data);
+        return textResponse({ encoding: "file", path, size: data.byteLength });
+      }
 
-// RETURNS: Base64 encoded binary data
+      if (validated.encoding === "base64") {
+        const MAX_BASE64_BYTES = 512 * 1024;
+        if (data.byteLength > MAX_BASE64_BYTES) {
+          return errResponse(
+            `Error: file too large for base64 (${data.byteLength} bytes, max ${MAX_BASE64_BYTES}). Use encoding "url" to get a download link instead.`,
+          );
+        }
+        return textResponse({
+          encoding: "base64",
+          size: data.byteLength,
+          content: Buffer.from(data).toString("base64"),
+        });
+      }
 
-// USE CASE: Download original file (images, PDFs, executables, etc.) without conversion`,
-//     inputSchema: {
-//       system_id: z.number(),
-//       bucket: z.string(),
-//       filename: z.string().optional(),
-//     },
-//   },
-//   async (params) => {
-//     const validated = fileReadSchema.parse(params);
-
-//     const originalSystemId = getOriginalUuid("system_id", validated.system_id);
-//     if (!originalSystemId) {
-//       throw new Error(`Invalid system_id: ${validated.system_id}`);
-//     }
-
-//     const data = await intelxClient
-//       .fileRead(originalSystemId, validated.bucket)
-//       .then(normalizeIntelxId);
-
-//     const buffer = Buffer.from(data);
-//     const base64 = buffer.toString("base64");
-
-//     return {
-//       content: [
-//         {
-//           type: "text",
-//           text: `File downloaded (${buffer.length} bytes). Base64: ${base64.substring(0, 100)}...`,
-//         },
-//       ],
-//       structuredContent: {
-//         size: buffer.length,
-//         base64: base64,
-//       },
-//     };
-//   },
-// );
+      const fullText = new TextDecoder("utf-8", { fatal: false }).decode(data);
+      return textResponse(sliceLines(fullText, validated.offset, validated.limit));
+    } catch (error) {
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+  },
+);
 
 server.registerTool(
   "intelx_file_treeview",
@@ -552,7 +412,8 @@ USE CASES:
 
 REQUIRED:
 - bucket: The "bucket" field from search result
-- storage_id OR system_id: Use "indexfile" or "historyfile" field for archives, or "storage_id"/"system_id" for containers
+- indexfile: Use the "indexfile" field from search results (preferred for archives/containers)
+- OR storage_id / system_id: Use "storage_id"/"system_id" for direct lookups
 
 RETURNS: JSON array of related items with metadata (name, date, size, media type)
 
@@ -565,6 +426,7 @@ WORKFLOW:
       bucket: z.string(),
       storage_id: z.number().optional(),
       system_id: z.number().optional(),
+      indexfile: z.number().optional(),
     },
   },
   async (params) => {
@@ -572,60 +434,31 @@ WORKFLOW:
       const validated = fileTreeViewSchema.parse(params);
 
       let originalStorageId: string | undefined;
-      if (validated.storage_id) {
-        originalStorageId = getOriginalUuid("storage_id", validated.storage_id);
-        if (!originalStorageId) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Invalid storage_id: ${validated.storage_id}`,
-              },
-            ],
-            isError: true,
-          };
-        }
+      if (validated.indexfile) {
+        const resolved = resolveUuid("indexfile", validated.indexfile);
+        if (typeof resolved !== "string") return resolved;
+        originalStorageId = resolved;
+      } else if (validated.storage_id) {
+        const resolved = resolveUuid("storage_id", validated.storage_id);
+        if (typeof resolved !== "string") return resolved;
+        originalStorageId = resolved;
       }
 
       let originalSystemId: string | undefined;
       if (validated.system_id) {
-        originalSystemId = getOriginalUuid("system_id", validated.system_id);
-        if (!originalSystemId) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Invalid system_id: ${validated.system_id}`,
-              },
-            ],
-            isError: true,
-          };
-        }
+        const resolved = resolveUuid("system_id", validated.system_id);
+        if (typeof resolved !== "string") return resolved;
+        originalSystemId = resolved;
       }
 
       const tree = await intelxClient
         .fileTreeView(validated.bucket, originalStorageId, originalSystemId)
+        .then((items) => normalizeTreeViewResponse(items, validated.bucket))
         .then(normalizeIntelxId);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(tree),
-          },
-        ],
-        structuredContent: { tree } as Record<string, unknown>,
-      };
+      return textResponse(tree);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
@@ -651,53 +484,19 @@ REQUIRED:
 RETURNS: Array of each selector found
 
 USE CASE: Discover related identifiers in a document to search for additional context`,
-    inputSchema: {
-      system_id: z.number(),
-    },
+    inputSchema: { system_id: z.number() },
   },
   async (params) => {
     try {
       const validated = getSelectorsSchema.parse(params);
+      const resolved = resolveUuid("system_id", validated.system_id);
+      if (typeof resolved !== "string") return resolved;
 
-      const originalSystemId = getOriginalUuid(
-        "system_id",
-        validated.system_id,
-      );
-      if (!originalSystemId) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error: Invalid system_id: ${validated.system_id}`,
-            },
-          ],
-          isError: true,
-        };
-      }
+      const selectors = await intelxClient.getSelectors(resolved).then(normalizeSelectors);
 
-      const selectors = await intelxClient
-        .getSelectors(originalSystemId)
-        .then(normalizeSelectors);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: selectors.join(" "),
-          },
-        ],
-        structuredContent: { selectors } as Record<string, unknown>,
-      };
+      return { content: [{ type: "text" as const, text: selectors.join(" ") }] };
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
@@ -711,29 +510,10 @@ server.registerTool(
   },
   async () => {
     try {
-      const capabilities = await intelxClient
-        .getCapabilities()
-        .then(normalizeIntelxId);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(capabilities),
-          },
-        ],
-        structuredContent: capabilities,
-      };
+      const capabilities = await intelxClient.getCapabilities().then(normalizeIntelxId);
+      return textResponse(capabilities);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
@@ -763,7 +543,7 @@ RETURNS: Array of breach records, each containing:
 
 USE CASE: Efficiently find data breaches, leaked credentials, and compromised accounts across an entire organization (e.g., all subdomains of set.or.th) with minimal API calls. Ideal for security teams monitoring for exposed PII or authentication details in stealer logs, paste sites, and dark web leaks.
 
-NOTE: Each line will limited to 64 characters. If you have interest in these file use intelx_file_read tool`,
+NOTE: Each line will limited to 64 characters. If you have interest in these file use intelx_file_view tool`,
     inputSchema: {
       selector: z.string(),
       maxresults: z.number().optional(),
@@ -779,23 +559,8 @@ NOTE: Each line will limited to 64 characters. If you have interest in these fil
     try {
       const validated = identitySearchSchema.parse(params);
 
-      // Validate selector format - should be a domain for identity search
-      const isDomain =
-        /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/i.test(
-          validated.selector,
-        );
-      const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(validated.selector);
-
-      if (!isDomain && !isEmail) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: selector should be a domain or email address",
-            },
-          ],
-          isError: true,
-        };
+      if (!isDomainOrEmail(validated.selector)) {
+        return errResponse("Error: selector should be a domain or email address");
       }
 
       const results = await identityClient
@@ -803,88 +568,14 @@ NOTE: Each line will limited to 64 characters. If you have interest in these fil
         .then(normalizeIdentityRecords)
         .then(normalizeIntelxId);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(results),
-          },
-        ],
-        structuredContent: { results } as Record<string, unknown>,
-      };
+      return textResponse(results);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-          },
-        ],
-        isError: true,
-      };
+      return errResponse(`Error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
   },
 );
 
-// server.registerTool(
-//   "intelx_export_accounts",
-//   {
-//     title: "Export Leaked Accounts",
-//     description: `Export leaked usernames and passwords from breaches.
-
-// SEARCH TERMS:
-// - Email: user@example.com
-// - Domain: example.com (all accounts in domain)
-// - Partial: @example.com (all accounts in domain)
-
-// PARAMETERS:
-// - selector: Email or domain (REQUIRED)
-// - maxresults: Max accounts to export (default: 100)
-// - buckets: Optional bucket filter
-// - datefrom/dateto: Date range "YYYY-MM-DD HH:MM:SS"
-
-// RETURNS: Array of {user, password, passwordtype, sourceshort}
-// - user: Username/email
-// - password: Plaintext or hash
-// - passwordtype: "plaintext", "md5", "sha1", "bcrypt", etc.
-// - sourceshort: Breach source name
-
-// WARNING: Contains sensitive credential data. Handle responsibly.`,
-//     inputSchema: {
-//       selector: z.string(),
-//       maxresults: z.number().optional(),
-//       buckets: z.string().optional(),
-//       datefrom: z.string().optional(),
-//       dateto: z.string().optional(),
-//       terminate: z.array(z.string()).optional(),
-//     },
-//   },
-//   async (params) => {
-//     const validated = exportAccountsSchema.parse(params);
-
-//     const accounts = await identityClient
-//       .exportAccounts(
-//         validated.selector,
-//         validated.maxresults,
-//         validated.buckets,
-//         validated.datefrom,
-//         validated.dateto,
-//         validated.terminate,
-//       )
-//       .then(normalizeAccountRecords)
-//       .then(normalizeIntelxId);
-
-//     return {
-//       content: [
-//         {
-//           type: "text",
-//           text: JSON.stringify(accounts),
-//         },
-//       ],
-//       structuredContent: { accounts } as Record<string, unknown>,
-//     };
-//   },
-// );
+// -- Resources --
 
 server.registerResource(
   "search",
@@ -898,24 +589,13 @@ server.registerResource(
       const results = await intelxClient
         .getSearchResults(searchId as string, 100)
         .then(normalizeIntelxId);
-
       return {
-        contents: [
-          {
-            uri: uri.href,
-            text: JSON.stringify(results),
-            mimeType: "application/json",
-          },
-        ],
+        contents: [{ uri: uri.href, text: JSON.stringify(results), mimeType: "application/json" }],
       };
     } catch (error) {
       return {
         contents: [
-          {
-            uri: uri.href,
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-            mimeType: "text/plain",
-          },
+          { uri: uri.href, text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`, mimeType: "text/plain" },
         ],
         isError: true,
       };
@@ -925,55 +605,30 @@ server.registerResource(
 
 server.registerResource(
   "file",
-  new ResourceTemplate("intelx://file/{systemId}/{bucket}", {
-    list: undefined,
-  }),
+  new ResourceTemplate("intelx://file/{systemId}/{bucket}", { list: undefined }),
   {
     title: "File Content",
     description: "Access file contents from Intelligence X",
-    inputSchema: {
-      storageId: z.number(),
-      bucket: z.string(),
-    },
   },
   async (uri, { systemId, bucket }) => {
     try {
       if (!systemId || !bucket) {
         return {
-          contents: [
-            {
-              uri: uri.href,
-              text: "Error: Missing required parameters",
-              mimeType: "text/plain",
-            },
-          ],
+          contents: [{ uri: uri.href, text: "Error: Missing required parameters", mimeType: "text/plain" }],
           isError: true,
         };
       }
-
       const data = await intelxClient.fileRead(
         getOriginalUuid("system_id", +systemId) as string,
         bucket as string,
       );
-      const buffer = Buffer.from(data);
-
       return {
-        contents: [
-          {
-            uri: uri.href,
-            blob: buffer.toString("base64"),
-            mimeType: "application/octet-stream",
-          },
-        ],
+        contents: [{ uri: uri.href, blob: Buffer.from(data).toString("base64"), mimeType: "application/octet-stream" }],
       };
     } catch (error) {
       return {
         contents: [
-          {
-            uri: uri.href,
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-            mimeType: "text/plain",
-          },
+          { uri: uri.href, text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`, mimeType: "text/plain" },
         ],
         isError: true,
       };
@@ -983,56 +638,29 @@ server.registerResource(
 
 server.registerResource(
   "tree",
-  new ResourceTemplate("intelx://tree/{storageId}/{bucket}", {
-    list: undefined,
-  }),
+  new ResourceTemplate("intelx://tree/{storageId}/{bucket}", { list: undefined }),
   {
     title: "File Tree",
     description: "Access file tree view from Intelligence X",
-    inputSchema: {
-      storageId: z.number(),
-      bucket: z.string(),
-    },
   },
   async (uri, { storageId, bucket }) => {
     try {
       if (!storageId || !bucket) {
         return {
-          contents: [
-            {
-              uri: uri.href,
-              text: "Error: Missing required parameters",
-              mimeType: "text/plain",
-            },
-          ],
+          contents: [{ uri: uri.href, text: "Error: Missing required parameters", mimeType: "text/plain" }],
           isError: true,
         };
       }
-
       const tree = await intelxClient
-        .fileTreeView(
-          bucket as string,
-          getOriginalUuid("storage_id", +storageId) as string,
-        )
+        .fileTreeView(bucket as string, getOriginalUuid("storage_id", +storageId) as string)
         .then(normalizeIntelxId);
-
       return {
-        contents: [
-          {
-            uri: uri.href,
-            text: JSON.stringify(tree),
-            mimeType: "application/json",
-          },
-        ],
+        contents: [{ uri: uri.href, text: JSON.stringify(tree), mimeType: "application/json" }],
       };
     } catch (error) {
       return {
         contents: [
-          {
-            uri: uri.href,
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-            mimeType: "text/plain",
-          },
+          { uri: uri.href, text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`, mimeType: "text/plain" },
         ],
         isError: true,
       };
@@ -1040,30 +668,67 @@ server.registerResource(
   },
 );
 
-const app = express();
-app.use(express.json());
+// -- Transport --
 
-app.post("/mcp", async (req, res) => {
-  // Create a new transport for each request to prevent request ID collisions
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-  });
-
-  res.on("close", () => {
-    transport.close();
-  });
-
+if (useStdio) {
+  const transport = new StdioServerTransport();
   await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-});
+} else {
+  const app = express();
+  app.use(express.json());
 
-const port = parseInt(process.env.PORT || "3000");
-app
-  .listen(port, () => {
-    console.log(`Demo MCP Server running on http://localhost:${port}/mcp`);
-  })
-  .on("error", (error) => {
-    console.error("Server error:", error);
-    process.exit(1);
+  app.post("/mcp", async (req, res) => {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   });
+
+  // One-time, TTL'd download endpoint for large/binary files.
+  // The tool returns the URL; bytes stream directly from IntelX to the
+  // client without passing through the LLM context.
+  app.get("/files/:token", async (req, res) => {
+    const entry = redeemFileToken(req.params.token);
+    if (!entry) {
+      res.status(404).json({ error: "invalid or expired token" });
+      return;
+    }
+    try {
+      const upstream = await intelxClient.fileReadResponse(entry.systemId, entry.bucket, entry.type);
+      const contentLength = upstream.headers.get("content-length");
+      if (contentLength) res.setHeader("Content-Length", contentLength);
+      res.setHeader("Content-Type", "application/octet-stream");
+      if (!upstream.body) {
+        res.end();
+        return;
+      }
+      const reader = upstream.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.write(Buffer.from(value))) {
+          await new Promise<void>((r) => res.once("drain", () => r()));
+        }
+      }
+      res.end();
+    } catch (error) {
+      if (!res.headersSent) {
+        res.status(502).json({ error: error instanceof Error ? error.message : "upstream error" });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  app
+    .listen(port, () => {
+      console.error(`IntelX MCP Server running on http://localhost:${port}/mcp`);
+    })
+    .on("error", (error) => {
+      console.error("Server error:", error);
+      process.exit(1);
+    });
+}
